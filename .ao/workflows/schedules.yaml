@@ -1,0 +1,5 @@
+schedules:
+  - id: weekly-org-audit
+    cron: "0 9 * * 1"
+    workflow_ref: audit-org
+    enabled: true

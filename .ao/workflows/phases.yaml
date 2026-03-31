@@ -1,0 +1,240 @@
+phases:
+  # ─── audit-org workflow phases ────────────────────────────────────────────
+
+  discover-repos:
+    mode: command
+    directive: |
+      Discover all active repositories in the GitHub org. Reads org name from
+      config/org-config.yaml (default: launchapp-dev). Writes repo list to
+      data/scan-results/repo-list.json, filtering out archived repos.
+    command:
+      program: bash
+      args:
+        - "-c"
+        - |
+          set -euo pipefail
+          mkdir -p data/scan-results/raw data/findings data/scores data/history output/scorecards
+
+          # Read org from config
+          ORG=$(python3 -c "import sys; import re; content=open('config/org-config.yaml').read(); m=re.search(r'^org:\s*(\S+)', content, re.M); print(m.group(1) if m else 'launchapp-dev')")
+
+          echo "Discovering repos for org: $ORG"
+
+          # Fetch repo list
+          gh repo list "$ORG" \
+            --json name,url,pushedAt,isArchived,defaultBranchRef,description \
+            --limit 200 \
+            > /tmp/all-repos.json
+
+          # Filter archived repos
+          python3 -c "
+          import json, sys
+          repos = json.load(open('/tmp/all-repos.json'))
+          active = [r for r in repos if not r.get('isArchived', False)]
+          print(f'Found {len(repos)} repos, {len(active)} active (filtered {len(repos)-len(active)} archived)')
+          json.dump(active, open('data/scan-results/repo-list.json', 'w'), indent=2)
+          "
+          echo "Repo list written to data/scan-results/repo-list.json"
+      cwd_mode: project_root
+      timeout_secs: 60
+
+  scan-repos:
+    mode: command
+    directive: |
+      Scan all repos discovered in discover-repos phase. For each repo, runs gh API
+      calls to collect stale PRs, security advisories, file existence checks, languages,
+      and commit history. Writes raw JSON per repo to data/scan-results/raw/.
+    command:
+      program: bash
+      args: ["-c", "bash scripts/scan-repos.sh"]
+      cwd_mode: project_root
+      timeout_secs: 600
+
+  normalize-findings:
+    mode: agent
+    agent: scanner
+    directive: |
+      Read all raw scan files from data/scan-results/raw/ and data/scan-results/repo-list.json.
+      Normalize each repo's raw data into structured findings following the findings schema.
+      Calculate stale PRs (open > 7 days), identify missing files, and extract all signals.
+
+      Write each normalized findings file to data/findings/{repo-name}.json.
+      Write aggregate summary to data/findings/summary.json.
+
+      The raw scan files are named {repo-name}.json. Each contains:
+      - pr_list: output of gh pr list (array)
+      - vulnerability_alerts: HTTP status + body from gh api vulnerability-alerts endpoint
+      - workflows_dir: HTTP status + body from contents/.github/workflows
+      - readme_check: HTTP status from contents/README.md
+      - license_check: HTTP status from contents/LICENSE
+      - languages: language breakdown object
+      - last_commit: array with one commit object
+      - topics: topics object with names[]
+
+      For missing file detection: 404 status = file missing, 200 = exists.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  score-repos:
+    mode: agent
+    agent: analyzer
+    directive: |
+      Read all findings from data/findings/ (skip summary.json) and score each repo.
+      Apply the rubric from config/scoring-rubric.yaml exactly.
+
+      For each repo, write data/scores/{repo-name}.json with:
+      {
+        "repo_name": "...",
+        "overall_score": 0-100,
+        "status": "healthy|warning|critical",
+        "dimensions": {
+          "maintenance": {"score": 0-25, "max": 25, "checks": [...]},
+          "security": {"score": 0-25, "max": 25, "checks": [...]},
+          "documentation": {"score": 0-25, "max": 25, "checks": [...]},
+          "ci_cd": {"score": 0-25, "max": 25, "checks": [...]}
+        },
+        "top_issues": [{"issue": "...", "dimension": "...", "points_lost": 0, "recommendation": "..."}],
+        "scored_at": "ISO timestamp"
+      }
+
+      Also write data/scores/org-summary.json with aggregate stats:
+      {
+        "org": "...",
+        "total_repos": 0,
+        "healthy_count": 0,
+        "warning_count": 0,
+        "critical_count": 0,
+        "average_score": 0,
+        "lowest_score": {"repo": "...", "score": 0},
+        "highest_score": {"repo": "...", "score": 0},
+        "scored_at": "ISO timestamp"
+      }
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  review-scores:
+    mode: agent
+    agent: analyzer
+    directive: |
+      Sanity-check the completed scoring run. Read data/scores/org-summary.json and
+      sample 5-10 individual score files from data/scores/.
+
+      Check for anomalies:
+      1. Are >80% of repos marked critical? (likely a scoring bug or config problem)
+      2. Does any repo have a score that contradicts its findings? (e.g., score=90 but missing README + CI)
+      3. Is the org average outside the range 20-90? (suspicious)
+      4. Are there repos in findings/ that are missing from scores/?
+
+      Decision contract:
+      - verdict: "approve" — scoring looks reasonable, proceed to report generation
+      - verdict: "adjust" — anomalies detected, return to score-repos with corrections
+      - reasoning: explain your decision (required)
+      - adjustments: (only for "adjust") list of specific corrections to apply
+    decision_contract:
+      required_fields: [verdict, reasoning]
+
+  generate-scorecards:
+    mode: agent
+    agent: reporter
+    directive: |
+      Generate all output artifacts for this audit run.
+
+      1. For each repo in data/scores/ (skip org-summary.json), create output/scorecards/{repo-name}.md
+         with the full scorecard format (score badge, dimension table, top issues, recommendations).
+
+      2. Create output/dashboard.md — the org-wide health dashboard:
+         - Pull from data/scores/org-summary.json for aggregate stats
+         - Check data/history/ for the most recent previous run to compute week-over-week trend
+         - Include full repo table sorted by score (ascending — worst first)
+         - Top 5 critical repos highlighted
+         - Top 5 healthiest repos section
+
+      3. Save current scores snapshot to data/history/{today-date}-scores.json:
+         Copy data/scores/org-summary.json content + add full repo scores array.
+
+      Use today's date (from system or file timestamps) for the history filename.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  triage-issues:
+    mode: agent
+    agent: analyzer
+    directive: |
+      Review all scored repos and decide which critical findings warrant GitHub issues.
+
+      Rules:
+      - Always create issues for: critical repos (score < 40)
+      - Also create issues for: warning repos (40-69) that have open security advisories
+      - Skip: healthy repos, warning repos without security advisories
+      - Deduplicate: read data/issue-tracker.json — do not propose issues for findings
+        that already have an open issue (match on repo + finding_type)
+
+      For each issue to create, prepare:
+      - repo_full_name: "org/repo-name" format
+      - finding_type: "missing_readme" | "security_advisory" | "stale_prs" | "missing_ci" | "missing_license"
+      - title: from config/issue-templates.yaml with variables filled in
+      - body: from config/issue-templates.yaml with variables filled in
+      - labels: ["repo-health", "automated"] + severity label
+      - severity: "critical" | "warning"
+
+      Decision contract:
+      - verdict: "create-issues" — issues ready to create (issues_to_create[] populated)
+      - verdict: "skip-issues" — no issues needed this run
+      - reasoning: explain the decision
+      - issues_to_create: array of issue objects (empty array for skip-issues verdict)
+    decision_contract:
+      required_fields: [verdict, reasoning]
+
+  create-issues:
+    mode: agent
+    agent: issue-creator
+    directive: |
+      Create GitHub issues for all findings in the issues_to_create[] list from the
+      triage-issues phase decision output.
+
+      For each issue:
+      1. Check data/issue-tracker.json again to prevent duplicates (final safeguard)
+      2. Use gh-cli-mcp to create the issue in repo_full_name with title, body, labels
+      3. Record the created issue URL immediately in data/issue-tracker.json
+      4. If creation fails, log the error and continue with remaining issues
+
+      After all issues are processed, write a final summary to the output.
+      Capabilities include writes_files (for issue-tracker.json update) and mutates_state.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+      requires_commit: true
+
+  # ─── quick-check workflow phases ──────────────────────────────────────────
+
+  scan-single:
+    mode: command
+    directive: |
+      Scan a single repository. The repo name comes from {{subject_title}}.
+      Runs all health checks and writes raw scan data to data/scan-results/raw/{repo-name}.json.
+    command:
+      program: bash
+      args: ["-c", "bash scripts/scan-single-repo.sh {{subject_title}}"]
+      cwd_mode: project_root
+      timeout_secs: 120
+
+  analyze-single:
+    mode: agent
+    agent: analyzer
+    directive: |
+      Perform a full health analysis on the single repo scanned in scan-single phase.
+      The repo name is {{subject_title}}.
+
+      1. Read data/scan-results/raw/{{subject_title}}.json
+      2. Normalize findings inline (no separate scanner phase for quick-check)
+      3. Score using config/scoring-rubric.yaml
+      4. Write score to data/scores/{{subject_title}}.json
+      5. Generate scorecard to output/scorecards/{{subject_title}}.md
+
+      Output a clear summary: overall score, status badge, top 3 issues, and next steps.
+    capabilities:
+      mutates_state: true
+      writes_files: true

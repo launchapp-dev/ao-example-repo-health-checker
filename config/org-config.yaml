@@ -1,0 +1,18 @@
+org: launchapp-dev
+
+exclude_patterns:
+  - "*.github.io"
+  - "archive-*"
+  - ".github"
+
+scan_options:
+  stale_pr_threshold_days: 7
+  inactive_repo_threshold_days: 90
+  max_repos: 200
+  rate_limit_delay_ms: 200
+
+issue_creation:
+  enabled: true
+  create_for_critical: true
+  create_for_warning_with_security: true
+  dry_run: false

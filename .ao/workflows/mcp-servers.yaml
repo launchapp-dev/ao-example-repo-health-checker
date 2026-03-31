@@ -1,0 +1,25 @@
+mcp_servers:
+  filesystem:
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-filesystem"
+      - "."
+      - "./data"
+      - "./output"
+      - "./config"
+      - "./scripts"
+
+  sequential-thinking:
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-sequential-thinking"
+
+  github:
+    command: npx
+    args:
+      - "-y"
+      - "gh-cli-mcp"
+    env:
+      GH_TOKEN: "${GH_TOKEN}"

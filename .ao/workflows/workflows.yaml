@@ -1,0 +1,43 @@
+default_workflow_ref: audit-org
+
+workflows:
+  - id: audit-org
+    name: "Org-Wide Health Audit"
+    description: "Full health audit of all repos in a GitHub org — scan, score, report, and create issues"
+    phases:
+      - discover-repos
+      - scan-repos
+      - normalize-findings
+      - score-repos
+      - review-scores:
+          on_verdict:
+            adjust:
+              target: score-repos
+          max_rework_attempts: 2
+      - generate-scorecards
+      - triage-issues:
+          on_verdict:
+            skip-issues:
+              target: null
+      - create-issues
+    post_success:
+      merge:
+        strategy: squash
+        target_branch: main
+        create_pr: true
+        auto_merge: true
+        cleanup_worktree: true
+
+  - id: quick-check
+    name: "Quick Single-Repo Health Check"
+    description: "On-demand health check for a single repository — scan and scorecard in minutes"
+    phases:
+      - scan-single
+      - analyze-single
+    post_success:
+      merge:
+        strategy: squash
+        target_branch: main
+        create_pr: true
+        auto_merge: true
+        cleanup_worktree: true
